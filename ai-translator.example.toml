@@ -1,0 +1,21 @@
+[ollama]
+base_url = "http://localhost:11434"
+timeout_seconds = 600
+
+[translation]
+target_locale = "en"
+task_kind = "simplification"
+target_reading_level = "4th grade"
+candidate_models = ["qwen", "mistral", "gemma"]
+temperature = 0.2
+num_ctx = 8192
+
+[models.qwen]
+name = "qwen3:8b"
+
+[models.mistral]
+name = "mistral:latest"
+
+[models.gemma]
+name = "gemma3:4b"
+

@@ -1,0 +1,20 @@
+[ollama]
+base_url = "http://localhost:11434"
+timeout_seconds = 600
+
+[evaluation]
+plugins = ["fidelity", "readability", "consistency"]
+candidate_models = ["qwen", "mistral", "gemma"]
+batch_size = 10
+temperature = 0.0
+num_ctx = 8192
+
+[evaluator_models.qwen]
+name = "qwen3:8b"
+
+[evaluator_models.mistral]
+name = "mistral:latest"
+
+[evaluator_models.gemma]
+name = "gemma3:4b"
+
