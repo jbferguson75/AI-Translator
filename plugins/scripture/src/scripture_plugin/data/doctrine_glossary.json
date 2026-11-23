@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "description": "Starter doctrinal concepts. These are review references, not authoritative interpretations or target-language prescriptions.",
+  "entries": [
+    {"source_term": "atonement", "preferred_translation": "", "notes": "Preserve the source passage's meaning and its relationship to Jesus Christ; do not substitute an unrelated concept."},
+    {"source_term": "covenant", "preferred_translation": "", "notes": "Keep covenant distinct from a casual promise when the passage makes that distinction."},
+    {"source_term": "grace", "preferred_translation": "", "notes": "Preserve the theological sense indicated by context; do not flatten it to generic kindness without evidence."},
+    {"source_term": "redemption", "preferred_translation": "", "notes": "Check that the translation preserves the source passage's redemption or deliverance concept."},
+    {"source_term": "resurrection", "preferred_translation": "", "notes": "Preserve the passage's meaning about resurrection; flag omission or conflation with a different concept."},
+    {"source_term": "faith", "preferred_translation": "", "notes": "Retain the contextual meaning of faith; distinguish it from mere opinion when supported by the text."},
+    {"source_term": "ordinance", "preferred_translation": "", "notes": "Preserve the source's religious-practice sense when context supports it."}
+  ]
+}

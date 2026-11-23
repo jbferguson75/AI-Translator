@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "authors": {
+    "Nephi": {
+      "voice_profile": "Evaluate for a first-person witness voice, reflective narration, personal testimony, and transitions between narrative and exhortation. Treat these as review cues, not mandatory stylistic rules.",
+      "books": ["1 Nephi", "2 Nephi"]
+    },
+    "Jacob": {
+      "voice_profile": "Evaluate for direct exhortation, sustained scriptural argument, and personal testimony where present. Do not require a fixed style or infer doctrine beyond the supplied passage.",
+      "books": ["Jacob"]
+    },
+    "Enos": {
+      "voice_profile": "Evaluate for a personal first-person account, prayerful reflection, and changes in audience or concern where supported by the passage.",
+      "books": ["Enos"]
+    },
+    "Jarom": {
+      "voice_profile": "Evaluate for concise historical summary and community-focused narration where supported by the passage.",
+      "books": ["Jarom"]
+    },
+    "Omni": {
+      "voice_profile": "Evaluate for concise record-keeping and changes of speaker or perspective. Do not assume every passage has the same narrator.",
+      "books": ["Omni"]
+    },
+    "Mormon": {
+      "voice_profile": "Evaluate for abridging or record-keeper framing, historical narration, and editorial perspective where supported by the passage.",
+      "books": ["Words of Mormon", "Mosiah", "Alma", "Helaman", "3 Nephi", "4 Nephi", "Mormon"]
+    },
+    "Moroni": {
+      "voice_profile": "Evaluate for first-person record-keeper perspective, direct address, and concluding exhortation where supported by the passage.",
+      "books": ["Ether", "Moroni"]
+    }
+  }
+}
