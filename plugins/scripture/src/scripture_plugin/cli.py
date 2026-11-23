@@ -16,8 +16,10 @@ from .glossary import DoctrineGlossary
 from .metadata import ScriptureMetadata
 from .registry import scripture_registry
 from .report import SCRIPTURE_PLUGIN_IDS, ScriptureReviewReport
+from .hierarchy_cli import app as hierarchy_review_app
 
 app = typer.Typer(no_args_is_help=True, help="Scripture-specific translation evaluation and review")
+app.add_typer(hierarchy_review_app, name="review")
 
 
 @app.command("evaluators")

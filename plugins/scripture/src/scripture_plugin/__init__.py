@@ -7,6 +7,8 @@ from .evaluators import (
     TerminologyDriftEvaluator,
 )
 from .registry import scripture_registry
+from .review_report import HierarchicalConsistencyReport
+from .review_service import HierarchicalReviewService, LEVEL_NAMES, LEVEL_PLUGINS
 
 __all__ = [
     "AuthorVoiceEvaluator",
@@ -14,4 +16,8 @@ __all__ = [
     "GlossaryComplianceEvaluator",
     "TerminologyDriftEvaluator",
     "scripture_registry",
+    "HierarchicalReviewService",
+    "HierarchicalConsistencyReport",
+    "LEVEL_NAMES",
+    "LEVEL_PLUGINS",
 ]
