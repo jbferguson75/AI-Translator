@@ -38,3 +38,5 @@ Create later schema changes with `alembic revision --autogenerate -m "descriptio
 - `Evaluation` identifies a translation evaluation series. Each `EvaluationVersion` points at the exact translation version it evaluated and has an independent version number and run manifest.
 - Segment-level output belongs to a translation version. Review decisions are immutable `HumanReview` events and can point to a resulting human-authored translation version.
 - The repository does not commit transactions. Keep model inference outside database write transactions and persist finished artifacts in short transactions.
+
+Glossaries are project-scoped and may contain multiple locale-pair sets. Glossary entry priority, translation-memory approval, occurrence counts, and source references support deterministic injection and conflict review. Alembic revision `0004_glossary_memory_usage` adds those usage fields; see [GLOSSARY_MEMORY.md](GLOSSARY_MEMORY.md) for management commands and conflict policy.

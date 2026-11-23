@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import UUID
@@ -14,15 +14,15 @@ from sqlalchemy.orm import Session
 from ..db.models import (
     Chunk,
     Document,
-    Glossary,
-    GlossaryEntry,
     ModelRun,
     PromptVersion,
     Translation,
-    TranslationMemory,
     TranslationSegment,
     TranslationVersion,
 )
+from ..glossary.errors import GlossaryConflictError
+from ..glossary.service import GlossaryService
+from ..translation_memory.service import TranslationMemoryConflictError, TranslationMemoryService
 from .config import ModelConfig, TranslationConfig
 from .errors import OllamaError, TranslationError
 from .ollama import Generation, OllamaClient
@@ -39,6 +39,7 @@ class CandidateResult:
     translated_chunks: int
     total_chunks: int
     error: str | None = None
+    scope_label: str = "document"
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,12 +85,19 @@ class TranslationService:
         chunk_limit: int | None = None,
         task_kind: str | None = None,
         target_reading_level: str | None = None,
+        book: str | None = None,
+        chapter: int | None = None,
+        based_on_translation_version_id: UUID | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> list[CandidateResult]:
         if not target_locale.strip():
             raise TranslationError("Target locale is required")
         if chunk_limit is not None and chunk_limit < 1:
             raise TranslationError("Chunk limit must be a positive integer")
+        if chapter is not None and chapter < 1:
+            raise TranslationError("Chapter number must be a positive integer")
+        if chapter is not None and not book:
+            raise TranslationError("Pass --book when selecting a chapter")
         models = config.resolve_models(model_selection)
         resolved_task_kind = task_kind or config.task_kind
         resolved_reading_level = (target_reading_level if target_reading_level is not None
@@ -102,18 +110,37 @@ class TranslationService:
         document = self.session.get(Document, document_id)
         if document is None:
             raise TranslationError(f"Document {document_id} does not exist")
-        source_chunks = list(self.session.scalars(
+        document_chunks = list(self.session.scalars(
             select(Chunk).where(Chunk.document_id == document.id).order_by(Chunk.ordinal)
         ))
-        if not source_chunks:
+        if not document_chunks:
             raise TranslationError("Document has no translatable chunks")
-        all_chunk_count = len(source_chunks)
+        document_chunk_count = len(document_chunks)
+        source_chunks = document_chunks
+        scope_label = "document"
+        scope_kind = "document"
+        if book is not None:
+            source_chunks = [chunk for chunk in source_chunks
+                             if str((chunk.locator or {}).get("book", "")).casefold() == book.casefold()]
+            if not source_chunks:
+                raise TranslationError(f"Book {book!r} was not found in document {document.title!r}")
+            scope_label = book
+            scope_kind = "book"
+        if chapter is not None:
+            source_chunks = [chunk for chunk in source_chunks
+                             if (chunk.locator or {}).get("chapter") == chapter]
+            if not source_chunks:
+                raise TranslationError(f"Chapter {chapter} of {book!r} has no source chunks")
+            scope_label = f"{book} {chapter}"
+            scope_kind = "chapter"
+        scope_chunk_count = len(source_chunks)
         if chunk_limit is not None:
             source_chunks = source_chunks[:chunk_limit]
         chunks = tuple(_SourceChunk(c.id, c.stable_key, c.ordinal, c.source_text,
                                     c.source_hash, dict(c.locator or {})) for c in source_chunks)
         self._report(progress_callback,
-                     f"Prepared {len(chunks)} of {all_chunk_count} source chunks from {document.title!r}.")
+                     f"Prepared {len(chunks)} of {scope_chunk_count} {scope_label} chunks "
+                     f"({document_chunk_count} in the document) from {document.title!r}.")
         self._report(progress_callback,
                      f"Task: {resolved_task_kind}; {document.source_locale} → {target_locale}; "
                      f"reading level: {resolved_reading_level or 'not specified'}.")
@@ -138,6 +165,10 @@ class TranslationService:
             self.session.add(translation)
             self.session.flush()
         translation_id = translation.id
+        if based_on_translation_version_id is not None:
+            parent_version = self.session.get(TranslationVersion, based_on_translation_version_id)
+            if parent_version is None or parent_version.translation_id != translation_id:
+                raise TranslationError("Based-on translation version must belong to this translation task")
         document_id = document.id
         project_id = document.project_id
         source_locale = document.source_locale
@@ -153,11 +184,15 @@ class TranslationService:
         prompt_version_id = prompt_version.id
         prompt_template_hash = prompt_version.content_hash
 
-        glossary = self._load_glossary(project_id, source_locale, target_locale)
-        memories = self._load_memories(project_id, source_locale, target_locale)
+        contexts = self._build_contexts(
+            chunks=chunks, project_id=project_id, source_locale=source_locale,
+            target_locale=target_locale,
+        )
+        glossary_count = len({item["id"] for context in contexts.values() for item in context["glossary"]})
+        memory_count = len({item["id"] for context in contexts.values() for item in context["memories"]})
         self._report(progress_callback,
-                     f"Loaded {len(glossary)} glossary terms and {len(memories)} approved translation memories.")
-        contexts = {chunk.id: self._context_for(chunk, glossary, memories) for chunk in chunks}
+                     f"Prepared {glossary_count} glossary term(s) and "
+                     f"{memory_count} distinct approved memory match(es) for these chunks.")
 
         # No transaction remains open while Ollama runs.
         self.session.commit()
@@ -183,7 +218,13 @@ class TranslationService:
                 model=model,
                 chunks=chunks,
                 contexts=contexts,
-                all_chunk_count=all_chunk_count,
+                scope_chunk_count=scope_chunk_count,
+                document_chunk_count=document_chunk_count,
+                scope_label=scope_label,
+                scope_kind=scope_kind,
+                scope_book=book,
+                scope_chapter=chapter,
+                parent_version_id=based_on_translation_version_id,
                 translation_id=translation_id,
                 document_id=document_id,
                 source_locale=source_locale,
@@ -203,7 +244,10 @@ class TranslationService:
 
     def _run_candidate(
         self, *, model: ModelConfig, chunks: tuple[_SourceChunk, ...],
-        contexts: dict[UUID, dict[str, Any]], all_chunk_count: int,
+        contexts: dict[UUID, dict[str, Any]], scope_chunk_count: int,
+        document_chunk_count: int, scope_label: str, scope_kind: str,
+        scope_book: str | None, scope_chapter: int | None,
+        parent_version_id: UUID | None,
         translation_id: UUID, document_id: UUID, source_locale: str,
         target_locale: str, task_kind: str, domain: str, reading_level: str,
         template_text: str, prompt_key: str, prompt_version_id: UUID,
@@ -264,7 +308,7 @@ class TranslationService:
                          f"{chunk_index}/{len(chunks)} completed in {elapsed:.1f}s "
                          f"({len(response.response)} characters).")
 
-        status = "completed" if len(outputs) == all_chunk_count else ("partial" if outputs else "failed")
+        status = "completed" if len(outputs) == scope_chunk_count else ("partial" if outputs else "failed")
         content_payload = [{"stable_key": chunk.stable_key, "target_text": response.response}
                            for chunk, response, _ in outputs]
         content_hash = hashlib.sha256(json.dumps(
@@ -304,6 +348,7 @@ class TranslationService:
         version = TranslationVersion(
             translation_id=translation_id,
             version_number=current_max + 1,
+            parent_version_id=parent_version_id,
             model_run_id=model_run.id,
             author_kind="model",
             status=status,
@@ -320,8 +365,14 @@ class TranslationService:
                 "prompt_version_id": str(prompt_version_id),
                 "prompt_template_hash": prompt_template_hash,
                 "input_chunk_count": len(chunks),
-                "document_chunk_count": all_chunk_count,
-                "complete_document": len(chunks) == all_chunk_count,
+                "scope": {"kind": scope_kind, "label": scope_label,
+                          "book": scope_book, "chapter": scope_chapter},
+                "based_on_translation_version_id": (str(parent_version_id)
+                                                     if parent_version_id else None),
+                "scope_chunk_count": scope_chunk_count,
+                "document_chunk_count": document_chunk_count,
+                "complete_scope": len(outputs) == scope_chunk_count,
+                "complete_document": len(outputs) == document_chunk_count,
                 "chunks": prompt_manifest,
                 "error": error,
             },
@@ -335,10 +386,21 @@ class TranslationService:
                 target_text=response.response,
                 target_hash=sha256_text(response.response),
             ))
+        glossary_usage: dict[UUID, set[str]] = defaultdict(set)
+        memory_usage: dict[UUID, set[str]] = defaultdict(set)
+        for chunk, _response, _prompt_hash in outputs:
+            reference = f"{document_id}:{chunk.stable_key}"
+            for item in contexts[chunk.id]["glossary"]:
+                glossary_usage[UUID(str(item["id"]))].add(reference)
+            for item in contexts[chunk.id]["memories"]:
+                memory_usage[UUID(str(item["id"]))].add(reference)
+        GlossaryService(self.session).record_usage(glossary_usage)
+        TranslationMemoryService(self.session).record_usage(memory_usage)
         self.session.commit()
         self._report(progress_callback,
                      f"[{model_index}/{model_count}] {model.alias}: saved translation version "
-                     f"{version.version_number} ({status}, {len(outputs)}/{all_chunk_count} chunks).")
+                     f"{version.version_number} ({status}, {len(outputs)}/{scope_chunk_count} "
+                     f"{scope_label} chunks).")
         return CandidateResult(
             model_alias=model.alias,
             model_name=model.model_name,
@@ -346,8 +408,9 @@ class TranslationService:
             version_number=version.version_number,
             status=status,
             translated_chunks=len(outputs),
-            total_chunks=all_chunk_count,
+            total_chunks=scope_chunk_count,
             error=error,
+            scope_label=scope_label,
         )
 
     @staticmethod
@@ -355,54 +418,51 @@ class TranslationService:
         if callback is not None:
             callback(message)
 
-    def _load_glossary(self, project_id: UUID, source_locale: str, target_locale: str) -> list[dict[str, Any]]:
-        rows = self.session.execute(
-            select(GlossaryEntry).join(Glossary).where(
-                Glossary.project_id == project_id,
-                Glossary.source_locale == source_locale,
-                Glossary.target_locale == target_locale,
-            ).order_by(GlossaryEntry.source_term)
-        ).scalars()
-        return [{"id": str(row.id), "source": row.source_term, "target": row.target_term,
-                 "notes": row.notes} for row in rows]
-
-    def _load_memories(self, project_id: UUID, source_locale: str, target_locale: str) -> list[dict[str, Any]]:
-        rows = self.session.scalars(select(TranslationMemory).where(
-            TranslationMemory.project_id == project_id,
-            TranslationMemory.source_locale == source_locale,
-            TranslationMemory.target_locale == target_locale,
-            TranslationMemory.approved.is_(True),
-        ).order_by(TranslationMemory.created_at.desc()))
-        return [{"id": str(row.id), "source": row.source_text, "target": row.target_text,
-                 "source_hash": row.source_hash} for row in rows]
-
-    @staticmethod
-    def _context_for(chunk: _SourceChunk, glossary: list[dict[str, Any]],
-                     memories: list[dict[str, Any]]) -> dict[str, Any]:
-        source_folded = chunk.source_text.casefold()
-        applicable_glossary = [entry for entry in glossary
-                               if entry["source"].casefold() in source_folded]
-        tokens = set(re.findall(r"\w+", source_folded, flags=re.UNICODE))
-        ranked: list[tuple[float, dict[str, Any]]] = []
-        for item in memories:
-            if item["source_hash"] == chunk.source_hash:
-                score = 1.0
-            else:
-                memory_tokens = set(re.findall(r"\w+", item["source"].casefold(), flags=re.UNICODE))
-                union = tokens | memory_tokens
-                score = len(tokens & memory_tokens) / len(union) if union else 0.0
-            if score > 0.0:
-                ranked.append((score, item))
-        ranked.sort(key=lambda pair: (-pair[0], pair[1]["id"]))
-        selected = [{**item, "similarity": round(score, 4)} for score, item in ranked[:3]]
-        return {"glossary": applicable_glossary, "memories": selected}
+    def _build_contexts(self, *, chunks: tuple[_SourceChunk, ...], project_id: UUID,
+                        source_locale: str, target_locale: str) -> dict[UUID, dict[str, Any]]:
+        glossary_service = GlossaryService(self.session)
+        memory_service = TranslationMemoryService(self.session)
+        glossary_entries = glossary_service.entries_for_scope(project_id, source_locale, target_locale)
+        memory_entries = memory_service.list_for_project(
+            project_id, source_locale=source_locale, target_locale=target_locale,
+        )
+        contexts: dict[UUID, dict[str, Any]] = {}
+        for chunk in chunks:
+            try:
+                glossary = glossary_service.resolve_for_text(
+                    project_id=project_id, source_locale=source_locale,
+                    target_locale=target_locale, source_text=chunk.source_text,
+                    entries=glossary_entries,
+                )
+                matches = memory_service.lookup(
+                    project_id=project_id, source_locale=source_locale,
+                    target_locale=target_locale, source_phrase=chunk.source_text, limit=3,
+                    entries=memory_entries,
+                )
+            except (GlossaryConflictError, TranslationMemoryConflictError) as exc:
+                raise TranslationError(str(exc)) from exc
+            memories = [{
+                "id": str(match.entry.id), "source": match.entry.source_text,
+                "target": match.entry.target_text, "source_hash": match.entry.source_hash,
+                "similarity": round(match.similarity, 4), "approved": match.entry.approved,
+                "occurrence_count": match.entry.occurrence_count,
+            } for match in matches]
+            contexts[chunk.id] = {"glossary": glossary, "memories": memories}
+        return contexts
 
     @staticmethod
     def _format_glossary(entries: list[dict[str, Any]]) -> str:
-        return "\n".join(f"{item['source']} → {item['target']}" +
-                          (f" ({item['notes']})" if item.get("notes") else "") for item in entries)
+        return "\n".join(
+            f"{item['source']} → {item['target']} "
+            f"[priority={item['priority']}; glossary={item['glossary']}]" +
+            (f" ({item['notes']})" if item.get("notes") else "")
+            for item in entries
+        )
 
     @staticmethod
     def _format_memories(items: list[dict[str, Any]]) -> str:
-        return "\n".join(f"{item['source']} → {item['target']}" for item in items)
+        return "\n".join(
+            f"{item['source']} → {item['target']} [similarity={item['similarity']:.3f}]"
+            for item in items
+        )
 

@@ -17,8 +17,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
 
 from .base import Base, Timestamped, UUIDPrimaryKey, utc_now
 
@@ -144,6 +145,7 @@ class TranslationVersion(UUIDPrimaryKey, Timestamped, Base):
     parent: Mapped[TranslationVersion | None] = relationship(remote_side="TranslationVersion.id", foreign_keys=[parent_version_id])
     model_run: Mapped[ModelRun | None] = relationship()
     segments: Mapped[list[TranslationSegment]] = relationship(back_populates="translation_version", cascade="all, delete-orphan")
+    glossary_suggestion_runs: Mapped[list[GlossarySuggestionRun]] = relationship(back_populates="translation_version")
 
 
 class TranslationSegment(UUIDPrimaryKey, Base):
@@ -233,16 +235,26 @@ class Glossary(UUIDPrimaryKey, Timestamped, Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     source_locale: Mapped[str] = mapped_column(String(35), nullable=False)
     target_locale: Mapped[str] = mapped_column(String(35), nullable=False)
+    target_language = synonym("target_locale")
+    project_scope = synonym("project_id")
     entries: Mapped[list[GlossaryEntry]] = relationship(back_populates="glossary", cascade="all, delete-orphan")
 
 
 class GlossaryEntry(UUIDPrimaryKey, Timestamped, Base):
     __tablename__ = "glossary_entries"
-    __table_args__ = (UniqueConstraint("glossary_id", "source_term", name="uq_glossary_source_term"),)
+    __table_args__ = (
+        UniqueConstraint("glossary_id", "source_term", name="uq_glossary_source_term"),
+        Index("ix_glossary_entries_term_priority", "source_term", "priority"),
+    )
     glossary_id: Mapped[UUID] = mapped_column(ForeignKey("glossaries.id", ondelete="RESTRICT"), nullable=False)
     source_term: Mapped[str] = mapped_column(String(500), nullable=False)
     target_term: Mapped[str] = mapped_column(String(500), nullable=False)
+    preferred_translation = synonym("target_term")
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     notes: Mapped[str | None] = mapped_column(Text)
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    source_references: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list,
+                                                        server_default=text("'[]'"))
     glossary: Mapped[Glossary] = relationship(back_populates="entries")
 
 
@@ -254,9 +266,65 @@ class TranslationMemory(UUIDPrimaryKey, Timestamped, Base):
     target_locale: Mapped[str] = mapped_column(String(35), nullable=False)
     source_text: Mapped[str] = mapped_column(Text, nullable=False)
     target_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_phrase = synonym("source_text")
+    preferred_translation = synonym("target_text")
     source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     origin_translation_version_id: Mapped[UUID | None] = mapped_column(ForeignKey("translation_versions.id", ondelete="RESTRICT"))
     approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    source_references: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list,
+                                                        server_default=text("'[]'"))
+
+
+class GlossarySuggestionRun(UUIDPrimaryKey, Timestamped, Base):
+    __tablename__ = "glossary_suggestion_runs"
+    __table_args__ = (
+        UniqueConstraint("translation_version_id", "version_number", name="uq_glossary_suggestion_run_version"),
+        Index("ix_glossary_suggestion_runs_version_status", "translation_version_id", "status"),
+    )
+    translation_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("translation_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    model_run_id: Mapped[UUID | None] = mapped_column(ForeignKey("model_runs.id", ondelete="RESTRICT"))
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="running")
+    model_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    model_digest: Mapped[str | None] = mapped_column(String(200))
+    prompt_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_response: Mapped[str | None] = mapped_column(Text)
+    run_manifest: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    translation_version: Mapped[TranslationVersion] = relationship(back_populates="glossary_suggestion_runs")
+    suggestions: Mapped[list[GlossarySuggestion]] = relationship(back_populates="suggestion_run")
+
+
+class GlossarySuggestion(UUIDPrimaryKey, Timestamped, Base):
+    __tablename__ = "glossary_suggestions"
+    __table_args__ = (
+        Index("ix_glossary_suggestions_run_status", "suggestion_run_id", "status"),
+        Index("ix_glossary_suggestions_project_term", "project_id", "source_term"),
+    )
+    suggestion_run_id: Mapped[UUID] = mapped_column(
+        ForeignKey("glossary_suggestion_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    project_id: Mapped[UUID] = mapped_column(ForeignKey("projects.id", ondelete="RESTRICT"), nullable=False)
+    source_locale: Mapped[str] = mapped_column(String(35), nullable=False)
+    target_locale: Mapped[str] = mapped_column(String(35), nullable=False)
+    source_term: Mapped[str] = mapped_column(String(500), nullable=False)
+    preferred_translation: Mapped[str] = mapped_column(String(500), nullable=False)
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_references: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    reasoning: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="proposed")
+    glossary_entry_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("glossary_entries.id", ondelete="RESTRICT")
+    )
+    resolved_by: Mapped[str | None] = mapped_column(String(200))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolution_note: Mapped[str | None] = mapped_column(Text)
+    suggestion_run: Mapped[GlossarySuggestionRun] = relationship(back_populates="suggestions")
+    glossary_entry: Mapped[GlossaryEntry | None] = relationship()
 
 
 class PromptVersion(UUIDPrimaryKey, Timestamped, Base):
