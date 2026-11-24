@@ -40,3 +40,5 @@ Create later schema changes with `alembic revision --autogenerate -m "descriptio
 - The repository does not commit transactions. Keep model inference outside database write transactions and persist finished artifacts in short transactions.
 
 Glossaries are project-scoped and may contain multiple locale-pair sets. Glossary entry priority, translation-memory approval, occurrence counts, and source references support deterministic injection and conflict review. Alembic revision `0004_glossary_memory_usage` adds those usage fields; see [GLOSSARY_MEMORY.md](GLOSSARY_MEMORY.md) for management commands and conflict policy.
+
+Human review passes create pending events per translated chunk. Decisions append immutable events and approved text creates a separate `author_kind="human"` translation version. Revision `0006_human_review_workflow` adds approval fields and per-item SHA-256 audit chains; see [HUMAN_REVIEW.md](HUMAN_REVIEW.md) for the CLI workflow.

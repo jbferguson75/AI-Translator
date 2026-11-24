@@ -110,7 +110,27 @@ class DocumentRemovalService:
             clauses.append(f"review_pass_id IN ({', '.join('?' for _ in review_pass_ids)})")
             params.extend(review_pass_ids)
         if clauses:
-            execute(f"DELETE FROM human_reviews WHERE {' OR '.join(clauses)}", tuple(params))
+            affected_review_ids = [row[0] for row in execute(
+                f"SELECT id FROM human_reviews WHERE {' OR '.join(clauses)}", tuple(params)
+            )]
+            # Review events form a self-referential, append-only hash chain.
+            # Purge leaves first so SQLite's RESTRICT foreign key remains
+            # enabled and every reference is removed in a valid order.
+            remaining_reviews = set(affected_review_ids)
+            while remaining_reviews:
+                ids_sql = ", ".join("?" for _ in remaining_reviews)
+                leaves = [row[0] for row in execute(
+                    "SELECT candidate.id FROM human_reviews AS candidate "
+                    f"WHERE candidate.id IN ({ids_sql}) AND NOT EXISTS ("
+                    "SELECT 1 FROM human_reviews AS child "
+                    "WHERE child.supersedes_review_id = candidate.id)",
+                    tuple(remaining_reviews),
+                )]
+                if not leaves:
+                    raise RuntimeError("Cannot purge human review events: supersedes cycle detected")
+                leaf_sql = ", ".join("?" for _ in leaves)
+                execute(f"DELETE FROM human_reviews WHERE id IN ({leaf_sql})", tuple(leaves))
+                remaining_reviews.difference_update(leaves)
         if review_pass_ids:
             execute(
                 f"DELETE FROM review_passes WHERE id IN ({', '.join('?' for _ in review_pass_ids)})",

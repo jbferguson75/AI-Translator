@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import typer
 from pathlib import Path
+from datetime import datetime
 from uuid import UUID
 from sqlalchemy import inspect, select
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -21,6 +22,7 @@ from ...translation.config import TranslationConfig
 from ...translation.errors import TranslationError
 from ...translation.ollama import OllamaClient
 from ...translation.service import TranslationService
+from ...translation.refinement import TranslationRefinementService
 from ...evaluation.config import EvaluationConfig
 from ...evaluation.errors import EvaluationError
 from ...evaluation.registry import default_registry
@@ -28,6 +30,7 @@ from ...evaluation.service import EvaluationService
 from ...glossary.service import GlossaryService
 from ...glossary.suggestions import GlossarySuggestionService
 from ...translation_memory.service import TranslationMemoryService
+from ...review.service import HumanReviewService
 
 app = typer.Typer(no_args_is_help=True, help="Local-first translation platform")
 import_app = typer.Typer(no_args_is_help=True, help="Import immutable source material")
@@ -38,6 +41,7 @@ evaluation_app = typer.Typer(no_args_is_help=True, help="Search stored evaluatio
 evaluators_app = typer.Typer(no_args_is_help=True, help="Inspect registered evaluation plugins")
 glossary_app = typer.Typer(no_args_is_help=True, help="Manage project translation glossaries")
 memory_app = typer.Typer(no_args_is_help=True, help="Manage and search translation memories")
+human_review_app = typer.Typer(no_args_is_help=True, help="Review, approve, and audit translation versions")
 app.add_typer(import_app, name="import")
 app.add_typer(db_app, name="db")
 app.add_typer(project_app, name="project")
@@ -46,6 +50,7 @@ app.add_typer(evaluation_app, name="evaluation")
 app.add_typer(evaluators_app, name="evaluators")
 app.add_typer(glossary_app, name="glossary")
 app.add_typer(memory_app, name="memory")
+app.add_typer(human_review_app, name="human-review")
 
 
 def _import_using_session(project: str, database: str):
@@ -116,6 +121,144 @@ def _parse_uuid(value: str, label: str) -> UUID:
         raise typer.BadParameter(f"{label} must be a UUID") from exc
 
 
+@human_review_app.command("create")
+def create_human_review_pass(
+    translation_version_id: str = typer.Argument(..., help="Immutable AI or human translation version UUID"),
+    name: str = typer.Option("Human review", "--name"),
+    assigned_to: str | None = typer.Option(None, "--assigned-to"),
+    created_by: str = typer.Option("local-user", "--created-by"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Create a review pass with one pending item for every translated chunk."""
+    version_id = _parse_uuid(translation_version_id, "translation_version_id")
+    try:
+        review_pass, item_count = _run_db_action(database, lambda session: HumanReviewService(session).create_pass(
+            translation_version_id=version_id, name=name, assigned_to=assigned_to, created_by=created_by,
+        ))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Created review pass {review_pass.id}: {item_count} pending item(s) for version {version_id}")
+
+
+@human_review_app.command("passes")
+def list_human_review_passes(
+    translation_version_id: str | None = typer.Option(None, "--translation-version"),
+    status: str | None = typer.Option(None, "--status", help="Filter by pass status, e.g. open or completed"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """List review passes and their source translation versions."""
+    version_id = _parse_uuid(translation_version_id, "translation_version_id") if translation_version_id else None
+    rows = _run_db_action(database, lambda session: [
+        f"{item.id}\t{item.status}\t{item.name}\tassigned_to={item.assigned_to or '-'}\t"
+        f"translation_version={item.translation_version_id}\tcreated={item.created_at.isoformat()}"
+        for item in HumanReviewService(session).list_passes(translation_version_id=version_id, status=status)
+    ])
+    if not rows:
+        typer.echo("No human review passes found.")
+    for row in rows:
+        typer.echo(row)
+
+
+@human_review_app.command("items")
+def list_human_review_items(
+    review_pass_id: str = typer.Argument(...),
+    status: str | None = typer.Option(None, "--status", help="pending, approved, rejected, or needs_revision"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """List current review items, source text, candidate text, and decision state."""
+    pass_id = _parse_uuid(review_pass_id, "review_pass_id")
+    if status is not None and status not in {"pending", "approved", "rejected", "needs_revision"}:
+        raise typer.BadParameter("status must be pending, approved, rejected, or needs_revision")
+    try:
+        rows = _run_db_action(database, lambda session: [
+            f"{item.review_event_id}\t{item.status}\t{item.stable_key}\t"
+            f"chunk={item.chunk_id}\n  SOURCE: {item.source_text}\n  TARGET: {item.candidate_text}"
+            for item in HumanReviewService(session).items(pass_id, status=status)
+        ])
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if not rows:
+        typer.echo("No review items match that filter.")
+    for row in rows:
+        typer.echo(row)
+
+
+@human_review_app.command("decide")
+def decide_human_review(
+    review_event_id: str = typer.Argument(..., help="Current pending/current event UUID from human-review items"),
+    status: str = typer.Option(..., "--status", help="pending, approved, rejected, or needs_revision"),
+    reviewer: str = typer.Option(..., "--reviewer"),
+    review_notes: str | None = typer.Option(None, "--notes"),
+    correction: str | None = typer.Option(None, "--correction", help="Corrected target text for this chunk"),
+    override_reason: str | None = typer.Option(None, "--override-reason"),
+    approval_date: str | None = typer.Option(None, "--approval-date", help="ISO-8601 timestamp; defaults to now on approval"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Append a review decision; approved results create a new human-authored version."""
+    event_id = _parse_uuid(review_event_id, "review_event_id")
+    parsed_approval_date = None
+    if approval_date:
+        try:
+            parsed_approval_date = datetime.fromisoformat(approval_date.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise typer.BadParameter("approval_date must be an ISO-8601 timestamp") from exc
+    try:
+        event = _run_db_action(database, lambda session: HumanReviewService(session).decide(
+            review_event_id=event_id, status=status, reviewer=reviewer,
+            review_notes=review_notes, correction=correction,
+            override_reason=override_reason, approval_date=parsed_approval_date,
+        ))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(
+        f"Recorded {event.status} by {event.reviewer}; review event {event.id}; "
+        f"approved_at={event.approval_date.isoformat() if event.approval_date else '-'}; "
+        f"human_translation_version={event.resulting_translation_version_id or '-'}; "
+        f"audit_hash={event.event_hash}"
+    )
+
+
+@human_review_app.command("history")
+def human_review_history(
+    review_event_id: str = typer.Argument(...),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Show append-only event history for one review item."""
+    event_id = _parse_uuid(review_event_id, "review_event_id")
+    try:
+        rows = _run_db_action(database, lambda session: [
+            f"{item.id}\t{item.status}\treviewer={item.reviewer}\tcreated={item.created_at.isoformat()}\t"
+            f"approval_date={item.approval_date.isoformat() if item.approval_date else '-'}\t"
+            f"supersedes={item.supersedes_review_id or '-'}\tparent_hash={item.previous_event_hash or '-'}\t"
+            f"event_hash={item.event_hash}\n  notes={item.review_notes or '-'}\n  correction={item.correction or '-'}\n"
+            f"  override_reason={item.override_reason or '-'}\n"
+            f"  human_translation_version={item.resulting_translation_version_id or '-'}"
+            for item in HumanReviewService(session).history(event_id)
+        ])
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    for row in rows:
+        typer.echo(row)
+
+
+@human_review_app.command("audit")
+def verify_human_review_audit(
+    review_pass_id: str = typer.Argument(...),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Verify event ordering, supersedes links, and the per-item SHA-256 chain."""
+    pass_id = _parse_uuid(review_pass_id, "review_pass_id")
+    try:
+        result = _run_db_action(database, lambda session: HumanReviewService(session).verify_audit(pass_id))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Review pass {pass_id}: {result.event_count} event(s), audit {'valid' if result.valid else 'INVALID'}")
+    for error in result.errors:
+        typer.echo(f"  {error}", err=True)
+    if not result.valid:
+        raise typer.Exit(code=1)
+
+
 @db_app.command("upgrade")
 def upgrade_database(
     database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
@@ -164,6 +307,11 @@ def _stamp_existing_initial_schema(database: str) -> bool:
                 "glossary_entries": {"priority", "occurrence_count", "source_references"},
                 "translation_memories": {"occurrence_count", "source_references"},
             }
+            human_review_columns = {
+                "status", "approval_date", "review_notes", "correction", "override_reason",
+                "supersedes_review_id", "previous_event_hash", "event_hash",
+            }
+            human_review_workflow_present = False
             for table_name in expected_tables:
                 actual_columns = {column["name"] for column in inspector.get_columns(table_name)}
                 expected_columns = {column.name for column in Base.metadata.tables[table_name].columns}
@@ -187,6 +335,15 @@ def _stamp_existing_initial_schema(database: str) -> bool:
                             f"Unversioned table {table_name!r} does not match a known schema; refusing to stamp it"
                         )
                     continue
+                if table_name == "human_reviews":
+                    baseline_columns = expected_columns - human_review_columns
+                    if actual_columns == expected_columns:
+                        human_review_workflow_present = True
+                    elif actual_columns != baseline_columns:
+                        raise typer.BadParameter(
+                            "Unversioned human_reviews table does not match a known schema; refusing to stamp it"
+                        )
+                    continue
                 if actual_columns != expected_columns:
                     raise typer.BadParameter(
                         f"Unversioned database table {table_name!r} does not match the initial schema; "
@@ -206,6 +363,10 @@ def _stamp_existing_initial_schema(database: str) -> bool:
                 ) for action in ("update", "delete")),
                 "trg_documents_source_immutable", "trg_documents_source_no_delete",
             }
+            if human_review_workflow_present:
+                required_triggers.update({
+                    "trg_human_reviews_validate_insert", "trg_human_reviews_supersedes_scope",
+                })
             triggers = set(connection.exec_driver_sql(
                 "SELECT name FROM sqlite_master WHERE type='trigger'"
             ).scalars())
@@ -249,6 +410,15 @@ def _stamp_existing_initial_schema(database: str) -> bool:
                         .issubset(suggestion_indexes)):
                     raise typer.BadParameter("Glossary-suggestion schema is missing required indexes")
                 revision = "0005_glossary_suggestion_workflow"
+            if human_review_workflow_present:
+                if not present_suggestion_tables:
+                    raise typer.BadParameter(
+                        "Human-review workflow columns exist without preceding schema revisions; refusing to stamp"
+                    )
+                review_indexes = {index["name"] for index in inspector.get_indexes("human_reviews")}
+                if not {"ix_human_reviews_pass_chunk_created", "ix_human_reviews_status_created"}.issubset(review_indexes):
+                    raise typer.BadParameter("Human-review workflow is missing required indexes")
+                revision = "0006_human_review_workflow"
             if "alembic_version" not in table_names:
                 connection.exec_driver_sql(
                     "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
@@ -1048,6 +1218,144 @@ def translate_document(
                 typer.echo(f"  error: {candidate.error}", err=True)
     except TranslationError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _run_refinement_workflow(
+    *,
+    operation: str,
+    version_ids: list[UUID],
+    translation_config_path: Path,
+    evaluation_config_path: Path,
+    translation_models: str | None,
+    evaluator_models: str | None,
+    plugins: str | None,
+    database: str,
+    verbose: bool,
+):
+    try:
+        translation_config = TranslationConfig.from_file(translation_config_path)
+        evaluation_config = EvaluationConfig.from_file(evaluation_config_path)
+    except (TranslationError, EvaluationError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    selected_translation_models = (
+        [value.strip() for value in translation_models.split(",") if value.strip()]
+        if translation_models else None
+    )
+    selected_evaluator_models = (
+        [value.strip() for value in evaluator_models.split(",") if value.strip()]
+        if evaluator_models else None
+    )
+    selected_plugins = [value.strip() for value in plugins.split(",") if value.strip()] if plugins else None
+    engine = make_engine(database)
+    session = make_session_factory(engine)()
+    client = OllamaClient(translation_config.base_url, timeout_seconds=translation_config.timeout_seconds)
+    callback = (lambda message: typer.echo(message, err=True)) if verbose else None
+    try:
+        service = TranslationRefinementService(session, client)
+        if operation == "refinement":
+            candidates = service.refine_version(
+                translation_version_id=version_ids[0], config=translation_config,
+                model_selection=selected_translation_models, progress_callback=callback,
+            )
+        else:
+            candidates = service.synthesize_versions(
+                translation_version_ids=version_ids, config=translation_config,
+                model_selection=selected_translation_models, progress_callback=callback,
+            )
+        evaluation_client = OllamaClient(
+            evaluation_config.base_url, timeout_seconds=evaluation_config.timeout_seconds,
+        )
+        evaluations = {}
+        for candidate in candidates:
+            if candidate.status in {"completed", "partial"}:
+                evaluations[candidate.version_id] = EvaluationService(
+                    session, evaluation_client,
+                ).evaluate_translation_version(
+                    translation_version_id=candidate.version_id,
+                    config=evaluation_config,
+                    plugin_selection=selected_plugins,
+                    model_selection=selected_evaluator_models,
+                    progress_callback=callback,
+                )
+        return candidates, evaluations
+    except (TranslationError, EvaluationError) as exc:
+        session.rollback()
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def _print_refinement_results(candidates, evaluations) -> None:
+    for candidate in candidates:
+        typer.echo(
+            f"{candidate.operation} / {candidate.model_alias} ({candidate.model_name}): "
+            f"{candidate.status}, version {candidate.version_number}, "
+            f"{candidate.translated_chunks}/{candidate.total_chunks} chunks [id {candidate.version_id}]"
+        )
+        if candidate.error:
+            typer.echo(f"  error: {candidate.error}", err=True)
+        for evaluated in evaluations.get(candidate.version_id, []):
+            score = "n/a" if evaluated.score is None else f"{evaluated.score:.2f}"
+            typer.echo(
+                f"  evaluated {evaluated.plugin_id} / {evaluated.model_alias}: "
+                f"{evaluated.status}, score {score}, {evaluated.issue_count} issue(s), "
+                f"evaluation version {evaluated.evaluation_version_id}"
+            )
+
+
+@app.command("refine")
+def refine_translation(
+    translation_version_id: str = typer.Argument(..., help="Candidate version with saved evaluation feedback"),
+    config_file: Path = typer.Option(Path("ai-translator.toml"), "--config", "-c"),
+    evaluation_config_file: Path = typer.Option(
+        Path("ai-translator-evaluation.toml"), "--evaluation-config",
+    ),
+    models: str | None = typer.Option(None, "--models", help="Comma-separated configured revision model aliases"),
+    evaluator_models: str | None = typer.Option(
+        None, "--evaluator-models", help="Comma-separated configured evaluator model aliases",
+    ),
+    plugins: str | None = typer.Option(None, "--plugins", help="Comma-separated evaluator plugin IDs"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Revise one candidate from its own saved evaluation feedback, then reevaluate it."""
+    version_id = _parse_uuid(translation_version_id, "translation_version_id")
+    candidates, evaluations = _run_refinement_workflow(
+        operation="refinement", version_ids=[version_id],
+        translation_config_path=config_file, evaluation_config_path=evaluation_config_file,
+        translation_models=models, evaluator_models=evaluator_models, plugins=plugins,
+        database=database, verbose=verbose,
+    )
+    _print_refinement_results(candidates, evaluations)
+
+
+@app.command("synthesize")
+def synthesize_translation(
+    translation_version_ids: list[str] = typer.Argument(
+        ..., help="At least two evaluated candidate translation version UUIDs",
+    ),
+    config_file: Path = typer.Option(Path("ai-translator.toml"), "--config", "-c"),
+    evaluation_config_file: Path = typer.Option(
+        Path("ai-translator-evaluation.toml"), "--evaluation-config",
+    ),
+    models: str | None = typer.Option(None, "--models", help="Comma-separated configured synthesis model aliases"),
+    evaluator_models: str | None = typer.Option(
+        None, "--evaluator-models", help="Comma-separated configured evaluator model aliases",
+    ),
+    plugins: str | None = typer.Option(None, "--plugins", help="Comma-separated evaluator plugin IDs"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Synthesize a source-grounded candidate from multiple evaluated versions and reevaluate it."""
+    version_ids = [_parse_uuid(value, "translation_version_id") for value in translation_version_ids]
+    candidates, evaluations = _run_refinement_workflow(
+        operation="synthesis", version_ids=version_ids,
+        translation_config_path=config_file, evaluation_config_path=evaluation_config_file,
+        translation_models=models, evaluator_models=evaluator_models, plugins=plugins,
+        database=database, verbose=verbose,
+    )
+    _print_refinement_results(candidates, evaluations)
 
 
 @app.command("models")

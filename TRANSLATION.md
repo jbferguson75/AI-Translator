@@ -42,3 +42,12 @@ The default prompt is selected by task and domain. Simplification asks the model
 Approved translation memories are ranked deterministically by exact source hash and then word-set Jaccard similarity. The top three positive matches are injected per chunk. Glossary entries for the project's source and target locales are injected when their source term occurs in the chunk.
 
 The client uses Ollama's `POST /api/generate` endpoint with `stream: false` so each verse response can be stored as one aligned segment. [Ollama API reference](https://github.com/ollama/ollama/blob/main/docs/api.md)
+
+Use saved evaluation feedback to create immutable revised or synthesized versions, then reevaluate them:
+
+```sh
+ai-translator refine TRANSLATION_VERSION_UUID --verbose
+ai-translator synthesize VERSION_ID_1 VERSION_ID_2 VERSION_ID_3 --verbose
+```
+
+See [REFINEMENT.md](REFINEMENT.md) for the full workflow and configuration options.

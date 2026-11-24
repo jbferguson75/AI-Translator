@@ -219,14 +219,40 @@ class ReviewPass(UUIDPrimaryKey, Timestamped, Base):
 
 class HumanReview(UUIDPrimaryKey, Timestamped, Base):
     __tablename__ = "human_reviews"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected', 'needs_revision')",
+            name="ck_human_reviews_status",
+        ),
+        CheckConstraint(
+            "(status = 'approved' AND approval_date IS NOT NULL) OR "
+            "(status != 'approved' AND approval_date IS NULL)",
+            name="ck_human_reviews_approval_date",
+        ),
+        Index("ix_human_reviews_pass_chunk_created", "review_pass_id", "chunk_id", "created_at"),
+        Index("ix_human_reviews_status_created", "status", "created_at"),
+    )
     review_pass_id: Mapped[UUID] = mapped_column(ForeignKey("review_passes.id", ondelete="RESTRICT"), nullable=False)
     reviewer: Mapped[str] = mapped_column(String(200), nullable=False)
     decision: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending", server_default="pending")
     chunk_id: Mapped[UUID | None] = mapped_column(ForeignKey("chunks.id", ondelete="RESTRICT"))
     comment: Mapped[str | None] = mapped_column(Text)
     proposed_text: Mapped[str | None] = mapped_column(Text)
+    review_notes: Mapped[str | None] = mapped_column(Text)
+    correction: Mapped[str | None] = mapped_column(Text)
+    override_reason: Mapped[str | None] = mapped_column(Text)
+    approval_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    supersedes_review_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("human_reviews.id", ondelete="RESTRICT", name="fk_human_reviews_supersedes")
+    )
+    previous_event_hash: Mapped[str | None] = mapped_column(String(64))
+    event_hash: Mapped[str] = mapped_column(String(64), nullable=False, server_default=text("''"))
     resulting_translation_version_id: Mapped[UUID | None] = mapped_column(ForeignKey("translation_versions.id", ondelete="RESTRICT"))
     review_pass: Mapped[ReviewPass] = relationship(back_populates="reviews")
+    supersedes: Mapped[HumanReview | None] = relationship(
+        remote_side="HumanReview.id", foreign_keys=[supersedes_review_id]
+    )
 
 
 class Glossary(UUIDPrimaryKey, Timestamped, Base):
