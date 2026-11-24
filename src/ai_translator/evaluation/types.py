@@ -47,14 +47,18 @@ class EvaluationOutput:
     reasoning: str
     recommendations: tuple[str, ...]
     detected_issues: tuple[str, ...]
+    strengths: tuple[str, ...] = ()
+    issue_details: tuple[dict[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "score": self.score,
             "confidence": self.confidence,
             "reasoning": self.reasoning,
+            "strengths": list(self.strengths),
             "recommendations": list(self.recommendations),
             "detected_issues": list(self.detected_issues),
+            "issues": [dict(item) for item in self.issue_details],
         }
 
 

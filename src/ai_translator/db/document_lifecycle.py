@@ -20,7 +20,7 @@ class DocumentRemovalService:
     _IMMUTABLE_TABLES = (
         "documents", "books", "chapters", "verses", "chunks",
         "translation_versions", "translation_segments", "evaluation_versions",
-        "evaluation_results", "human_reviews", "published_outputs",
+        "translation_version_parents", "evaluation_results", "human_reviews", "published_outputs",
     )
 
     def __init__(self, session: Session):
@@ -81,6 +81,13 @@ class DocumentRemovalService:
             translation_version_ids = [row[0] for row in execute(
                 f"SELECT id FROM translation_versions WHERE translation_id IN ({ids_sql})", params
             )]
+        if translation_version_ids:
+            ids_sql = ", ".join("?" for _ in translation_version_ids)
+            execute(
+                "DELETE FROM translation_version_parents WHERE child_version_id IN (" + ids_sql + ") "
+                "OR parent_version_id IN (" + ids_sql + ")",
+                tuple(translation_version_ids) + tuple(translation_version_ids),
+            )
             evaluation_ids = [row[0] for row in execute(
                 f"SELECT id FROM evaluations WHERE translation_id IN ({ids_sql})", params
             )]

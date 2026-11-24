@@ -17,8 +17,10 @@ from ..db.models import (
     Evaluation,
     EvaluationResult,
     EvaluationVersion,
+    HumanReview,
     ModelRun,
     PromptVersion,
+    ReviewPass,
     Translation,
     TranslationSegment,
     TranslationVersion,
@@ -236,6 +238,14 @@ class TranslationRefinementService:
                 "task_kind": translation.task_kind,
                 "reading_level": translation.target_reading_level or "not specified",
                 "domain": translation.document.domain,
+                "content_type": (chunk.locator or {}).get("content_type", translation.document.domain),
+                "voice_profile": self._voice_profile(translation, chunk),
+                "translation_goals": json.dumps({
+                    "task_kind": translation.task_kind,
+                    "target_reading_level": translation.target_reading_level,
+                    "preserve_source_meaning": True,
+                    "avoid_new_concepts": True,
+                }, ensure_ascii=False, sort_keys=True),
                 "locator": json.dumps(chunk.locator or {}, ensure_ascii=False, sort_keys=True),
                 "source_text": segment.source_text,
                 "candidate_text": candidate_texts[0]["text"] if candidate_texts else "",
@@ -264,6 +274,9 @@ class TranslationRefinementService:
                 "rendered_prompt_hash": prompt_hash_for_chunk,
                 "glossary_snapshot": contexts[chunk.id]["glossary"],
                 "translation_memory_snapshot": contexts[chunk.id]["memories"],
+                "voice_profile": prompt_values["voice_profile"],
+                "content_type": prompt_values["content_type"],
+                "translation_goals": prompt_values["translation_goals"],
             }
             attempted_prompts.append(audit_item)
             self._report(progress_callback,
@@ -335,8 +348,11 @@ class TranslationRefinementService:
             parent_version_id=primary_parent_id,
             model_run_id=model_run.id,
             author_kind="model",
+            artifact_kind=("SYNTHESIZED_TRANSLATION" if operation == "synthesis"
+                           else "REFINED_TRANSLATION"),
             status=status,
             content_hash=content_hash,
+            prompt_version_id=prompt_version_id,
             run_manifest={
                 "operation": operation,
                 "operation_version": "1.0",
@@ -364,6 +380,13 @@ class TranslationRefinementService:
         )
         self.session.add(version)
         self.session.flush()
+        from ..db.models import TranslationVersionParent
+        for ordinal, source_version in enumerate(versions):
+            self.session.add(TranslationVersionParent(
+                child_version_id=version.id, parent_version_id=source_version.id,
+                relationship_kind=("source_candidate" if operation == "synthesis" else "parent"),
+                ordinal=ordinal,
+            ))
         glossary_usage: dict[UUID, set[str]] = defaultdict(set)
         memory_usage: dict[UUID, set[str]] = defaultdict(set)
         for segment, generation, _prompt_hash, _audit in generated:
@@ -492,6 +515,33 @@ class TranslationRefinementService:
                     selected_keys = keys if isinstance(keys, list) else sorted(known_keys)
                     for stable_key in selected_keys:
                         feedback[(translation_version_id, str(stable_key))].append(item)
+        review_rows = self.session.execute(
+            select(ReviewPass.translation_version_id, HumanReview)
+            .join(HumanReview, HumanReview.review_pass_id == ReviewPass.id)
+            .where(ReviewPass.translation_version_id.in_(version_ids),
+                   HumanReview.status.in_(("approved", "rejected", "needs_revision")),
+                   HumanReview.chunk_id.is_not(None))
+            .order_by(HumanReview.created_at, HumanReview.id)
+        ).all()
+        latest_reviews: dict[tuple[UUID, UUID], HumanReview] = {}
+        for input_version_id, review in review_rows:
+            latest_reviews[(input_version_id, review.chunk_id)] = review
+        chunk_lookup = dict(self.session.execute(
+            select(Chunk.id, Chunk.stable_key)
+            .join(TranslationSegment, TranslationSegment.chunk_id == Chunk.id)
+            .where(TranslationSegment.translation_version_id.in_(version_ids))
+        ).all())
+        for (input_version_id, chunk_id), review in latest_reviews.items():
+            stable_key = chunk_lookup.get(chunk_id)
+            if stable_key is None:
+                continue
+            feedback[(input_version_id, stable_key)].append({
+                "source": "human_review", "category": "human_review", "reviewer": review.reviewer,
+                "status": review.status, "review_notes": review.review_notes or review.comment,
+                "correction": review.correction, "proposed_text": review.proposed_text,
+                "override_reason": review.override_reason,
+                "human_review_event_id": str(review.id),
+            })
         if not latest:
             raise TranslationError(
                 "No completed evaluation feedback found for the input version(s); run evaluation first"
@@ -502,6 +552,9 @@ class TranslationRefinementService:
 
     @staticmethod
     def _feedback_record(evaluation_version, result, evaluation, model_alias, model_name, output):
+        issue_details = output.get("issues", result.issue_details or [])
+        if not isinstance(issue_details, list):
+            issue_details = []
         return {
             "evaluation_version_id": str(evaluation_version.id),
             "translation_version_id": str(evaluation_version.translation_version_id),
@@ -514,7 +567,31 @@ class TranslationRefinementService:
             "reasoning": output.get("reasoning", result.reasoning),
             "recommendations": output.get("recommendations", result.recommendations or []),
             "detected_issues": output.get("detected_issues", result.detected_issues or []),
+            "strengths": output.get("strengths", result.strengths or []),
+            "issues": issue_details,
         }
+
+    @staticmethod
+    def _voice_profile(translation: Translation, chunk: Chunk) -> str:
+        locator = chunk.locator or {}
+        if locator.get("voice_profile"):
+            return str(locator["voice_profile"])
+        author = locator.get("author")
+        book = locator.get("book") or locator.get("book_name")
+        try:
+            from scripture_plugin.metadata import ScriptureMetadata
+            metadata = ScriptureMetadata.load()
+            profile = metadata.profiles.get(author) if isinstance(author, str) and author else None
+            profile = profile or metadata.author_for_book(str(book) if book else None)
+            if profile:
+                return f"{profile.name}: {profile.voice_profile}"
+        except (ImportError, OSError, ValueError):
+            pass
+        settings = translation.document.project.settings or {}
+        profiles = settings.get("voice_profiles", {})
+        if isinstance(profiles, dict):
+            return str(profiles.get(book, profiles.get("default", "not specified")))
+        return "not specified"
 
     @staticmethod
     def _require_complete_feedback(versions, segments, feedback) -> None:

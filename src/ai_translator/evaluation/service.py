@@ -322,7 +322,10 @@ class EvaluationService:
                          else "partial")
             searchable_text = "\n".join((
                 merged.reasoning,
+                *merged.strengths,
                 *merged.detected_issues,
+                *(f"{item['type']} {item['severity']} {item['description']}"
+                  for item in merged.issue_details),
                 *merged.recommendations,
             ))
             result = EvaluationResult(
@@ -333,8 +336,10 @@ class EvaluationService:
                 score=merged.score,
                 confidence=merged.confidence,
                 reasoning=merged.reasoning,
+                strengths=list(merged.strengths),
                 recommendations=list(merged.recommendations),
                 detected_issues=list(merged.detected_issues),
+                issue_details=[dict(item) for item in merged.issue_details],
                 searchable_text=searchable_text,
                 value=merged.score,
                 categorical_value=plugin.plugin_id,
@@ -371,20 +376,30 @@ class EvaluationService:
         reasonings = []
         recommendations: list[str] = []
         issues: list[str] = []
+        strengths: list[str] = []
+        issue_details: list[dict[str, str]] = []
         for batch, output, _digest, _generation in outputs:
             span = f"{batch[0].stable_key}–{batch[-1].stable_key}"
             reasonings.append(f"[{span}] {output.reasoning}")
             for value, destination in ((output.recommendations, recommendations),
-                                       (output.detected_issues, issues)):
+                                       (output.detected_issues, issues),
+                                       (output.strengths, strengths)):
                 known = {item.casefold() for item in destination}
                 for item in value:
                     if item.casefold() not in known:
                         destination.append(item)
                         known.add(item.casefold())
+            known_details = {json.dumps(item, sort_keys=True) for item in issue_details}
+            for item in output.issue_details:
+                encoded = json.dumps(item, sort_keys=True)
+                if encoded not in known_details:
+                    issue_details.append(dict(item))
+                    known_details.add(encoded)
         return EvaluationOutput(
             score=round(score, 2), confidence=round(confidence, 4),
             reasoning="\n".join(reasonings), recommendations=tuple(recommendations),
-            detected_issues=tuple(issues),
+            detected_issues=tuple(issues), strengths=tuple(strengths),
+            issue_details=tuple(issue_details),
         )
 
     @staticmethod

@@ -351,8 +351,10 @@ class TranslationService:
             parent_version_id=parent_version_id,
             model_run_id=model_run.id,
             author_kind="model",
+            artifact_kind=("REFINED_TRANSLATION" if parent_version_id else "ORIGINAL_TRANSLATION"),
             status=status,
             content_hash=content_hash,
+            prompt_version_id=prompt_version_id,
             run_manifest={
                 "document_id": str(document_id),
                 "source_locale": source_locale,
@@ -379,6 +381,12 @@ class TranslationService:
         )
         self.session.add(version)
         self.session.flush()
+        if parent_version_id is not None:
+            from ..db.models import TranslationVersionParent
+            self.session.add(TranslationVersionParent(
+                child_version_id=version.id, parent_version_id=parent_version_id,
+                relationship_kind="parent", ordinal=0,
+            ))
         for chunk, response, _prompt_hash in outputs:
             self.session.add(TranslationSegment(
                 translation_version_id=version.id,
@@ -453,9 +461,9 @@ class TranslationService:
     @staticmethod
     def _format_glossary(entries: list[dict[str, Any]]) -> str:
         return "\n".join(
-            f"{item['source']} → {item['target']} "
-            f"[priority={item['priority']}; glossary={item['glossary']}]" +
-            (f" ({item['notes']})" if item.get("notes") else "")
+            f"{item['source']} → {item['target']}" +
+            (f" ({item['notes']})" if item.get("notes") else "") +
+            f" [priority={item['priority']}; glossary={item['glossary']}]"
             for item in entries
         )
 

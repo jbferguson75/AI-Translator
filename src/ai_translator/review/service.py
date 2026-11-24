@@ -212,13 +212,16 @@ class HumanReviewService:
         latest = self.session.scalar(select(func.max(TranslationVersion.version_number)).where(
             TranslationVersion.translation_id == base_version.translation_id
         )) or 0
+        original_text = next(segment.target_text for segment, chunk in segments if chunk.id == chunk_id)
+        changed = target_text != original_text
         version = TranslationVersion(
             translation_id=base_version.translation_id,
             version_number=latest + 1,
             parent_version_id=base_version.id,
             model_run_id=None,
             author_kind="human",
-            status="approved",
+            artifact_kind="HUMAN_EDIT" if changed else "FINAL_APPROVED",
+            status="reviewed" if changed else "approved",
             content_hash=content_hash,
             run_manifest={
                 "kind": "human_approved_translation",
@@ -235,6 +238,11 @@ class HumanReviewService:
         )
         self.session.add(version)
         self.session.flush()
+        from ..db.models import TranslationVersionParent
+        self.session.add(TranslationVersionParent(
+            child_version_id=version.id, parent_version_id=base_version.id,
+            relationship_kind="parent", ordinal=0,
+        ))
         for chunk, text in transformed:
             self.session.add(TranslationSegment(
                 translation_version_id=version.id,
@@ -243,7 +251,37 @@ class HumanReviewService:
                 target_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
             ))
         self.session.flush()
-        return version
+        if not changed:
+            return version
+        # Keep the human correction and its approval as distinct immutable artifacts.
+        final_version = TranslationVersion(
+            translation_id=base_version.translation_id,
+            version_number=latest + 2,
+            parent_version_id=version.id,
+            model_run_id=None,
+            author_kind="human",
+            artifact_kind="FINAL_APPROVED",
+            status="approved",
+            content_hash=content_hash,
+            run_manifest={"kind": "final_approved_translation",
+                          "human_edit_translation_version_id": str(version.id),
+                          "review_pass_id": str(review_pass.id),
+                          "human_review_event_id": str(review_event_id),
+                          "reviewer": reviewer, "approval_date": approval_date.isoformat()},
+        )
+        self.session.add(final_version)
+        self.session.flush()
+        self.session.add(TranslationVersionParent(
+            child_version_id=final_version.id, parent_version_id=version.id,
+            relationship_kind="parent", ordinal=0,
+        ))
+        for chunk, text in transformed:
+            self.session.add(TranslationSegment(
+                translation_version_id=final_version.id, chunk_id=chunk.id, target_text=text,
+                target_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            ))
+        self.session.flush()
+        return final_version
 
     def _refresh_pass_status(self, review_pass: ReviewPass) -> None:
         expected_chunks = {chunk.id for _segment, chunk in self._segments(review_pass.translation_version_id)}

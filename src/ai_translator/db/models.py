@@ -132,20 +132,71 @@ class TranslationVersion(UUIDPrimaryKey, Timestamped, Base):
     __table_args__ = (
         UniqueConstraint("translation_id", "version_number", name="uq_translation_versions_number"),
         Index("ix_translation_versions_translation_created", "translation_id", "created_at"),
+        Index("ix_translation_versions_artifact_kind", "artifact_kind", "created_at"),
+        CheckConstraint(
+            "artifact_kind IN ('ORIGINAL_TRANSLATION', 'REFINED_TRANSLATION', "
+            "'SYNTHESIZED_TRANSLATION', 'HUMAN_EDIT', 'FINAL_APPROVED')",
+            name="ck_translation_versions_artifact_kind",
+        ),
     )
     translation_id: Mapped[UUID] = mapped_column(ForeignKey("translations.id", ondelete="RESTRICT"), nullable=False)
     version_number: Mapped[int] = mapped_column(Integer, nullable=False)
     parent_version_id: Mapped[UUID | None] = mapped_column(ForeignKey("translation_versions.id", ondelete="RESTRICT"))
     model_run_id: Mapped[UUID | None] = mapped_column(ForeignKey("model_runs.id", ondelete="RESTRICT"))
     author_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="model")
+    artifact_kind: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="ORIGINAL_TRANSLATION", server_default="ORIGINAL_TRANSLATION",
+    )
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="draft")
     content_hash: Mapped[str | None] = mapped_column(String(64))
+    prompt_version_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("prompt_versions.id", ondelete="RESTRICT",
+                   name="fk_translation_versions_prompt_version_id_prompt_versions")
+    )
     run_manifest: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     translation: Mapped[Translation] = relationship(back_populates="versions")
     parent: Mapped[TranslationVersion | None] = relationship(remote_side="TranslationVersion.id", foreign_keys=[parent_version_id])
     model_run: Mapped[ModelRun | None] = relationship()
+    prompt_version: Mapped[PromptVersion | None] = relationship()
+    lineage_parents: Mapped[list[TranslationVersionParent]] = relationship(
+        foreign_keys="TranslationVersionParent.child_version_id",
+        back_populates="child", cascade="all, delete-orphan",
+    )
+    lineage_children: Mapped[list[TranslationVersionParent]] = relationship(
+        foreign_keys="TranslationVersionParent.parent_version_id",
+        back_populates="parent",
+    )
     segments: Mapped[list[TranslationSegment]] = relationship(back_populates="translation_version", cascade="all, delete-orphan")
     glossary_suggestion_runs: Mapped[list[GlossarySuggestionRun]] = relationship(back_populates="translation_version")
+
+
+class TranslationVersionParent(Base):
+    """Append-only lineage edge; supports multiple source candidates per artifact."""
+    __tablename__ = "translation_version_parents"
+    __table_args__ = (
+        Index("ix_translation_version_parents_parent", "parent_version_id", "child_version_id"),
+        CheckConstraint(
+            "relationship_kind IN ('parent', 'source_candidate')",
+            name="ck_translation_version_parents_kind",
+        ),
+    )
+    child_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("translation_versions.id", ondelete="RESTRICT",
+                   name="fk_translation_version_parents_child"), primary_key=True,
+    )
+    parent_version_id: Mapped[UUID] = mapped_column(
+        ForeignKey("translation_versions.id", ondelete="RESTRICT",
+                   name="fk_translation_version_parents_parent"), primary_key=True,
+    )
+    relationship_kind: Mapped[str] = mapped_column(String(30), primary_key=True, default="parent")
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    child: Mapped[TranslationVersion] = relationship(
+        foreign_keys=[child_version_id], back_populates="lineage_parents",
+    )
+    parent: Mapped[TranslationVersion] = relationship(
+        foreign_keys=[parent_version_id], back_populates="lineage_children",
+    )
 
 
 class TranslationSegment(UUIDPrimaryKey, Base):
@@ -196,8 +247,10 @@ class EvaluationResult(UUIDPrimaryKey, Base):
     score: Mapped[float | None] = mapped_column(Float)
     confidence: Mapped[float | None] = mapped_column(Float)
     reasoning: Mapped[str | None] = mapped_column(Text)
+    strengths: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     recommendations: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     detected_issues: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    issue_details: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     searchable_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
     value: Mapped[float | None] = mapped_column(Float)
     categorical_value: Mapped[str | None] = mapped_column(String(200))

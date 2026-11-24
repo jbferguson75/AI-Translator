@@ -16,10 +16,14 @@ def test_alembic_upgrade_creates_schema_and_immutability_triggers(tmp_path: Path
         tables = set(connection.execute(text(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )).scalars())
-        assert {"projects", "documents", "translation_versions", "evaluation_versions"} <= tables
+        assert {"projects", "documents", "translation_versions", "evaluation_versions",
+                "translation_version_parents"} <= tables
         triggers = set(connection.execute(text(
             "SELECT name FROM sqlite_master WHERE type='trigger'"
         )).scalars())
         assert "trg_documents_source_immutable" in triggers
         assert "trg_translation_versions_no_update" in triggers
+        assert "trg_translation_version_parents_no_update" in triggers
+        columns = {column[1] for column in connection.exec_driver_sql("PRAGMA table_info(evaluation_results)")}
+        assert {"strengths", "issue_details"} <= columns
 

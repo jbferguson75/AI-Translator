@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import typer
+import json
 from pathlib import Path
 from datetime import datetime
 from uuid import UUID
@@ -10,7 +11,7 @@ from alembic import command as alembic_command
 from alembic.config import Config as AlembicConfig
 from ...db.base import Base
 from ...db.models import (
-    Glossary, GlossaryEntry, GlossarySuggestionRun, Project, TranslationMemory,
+    Experiment, Glossary, GlossaryEntry, GlossarySuggestionRun, Project, TranslationMemory,
     TranslationVersion,
 )
 from ...db.document_lifecycle import DocumentRemovalService
@@ -23,6 +24,9 @@ from ...translation.errors import TranslationError
 from ...translation.ollama import OllamaClient
 from ...translation.service import TranslationService
 from ...translation.refinement import TranslationRefinementService
+from ...translation.iteration import TranslationIterationService
+from ...translation.reporting import (comparison_report, convergence_report, improvement_report,
+                                      lineage_report, side_by_side_report)
 from ...evaluation.config import EvaluationConfig
 from ...evaluation.errors import EvaluationError
 from ...evaluation.registry import default_registry
@@ -42,6 +46,8 @@ evaluators_app = typer.Typer(no_args_is_help=True, help="Inspect registered eval
 glossary_app = typer.Typer(no_args_is_help=True, help="Manage project translation glossaries")
 memory_app = typer.Typer(no_args_is_help=True, help="Manage and search translation memories")
 human_review_app = typer.Typer(no_args_is_help=True, help="Review, approve, and audit translation versions")
+review_app = typer.Typer(no_args_is_help=True, help="Compare reviewed translation candidates")
+report_app = typer.Typer(no_args_is_help=True, help="Translation lineage and quality reports")
 app.add_typer(import_app, name="import")
 app.add_typer(db_app, name="db")
 app.add_typer(project_app, name="project")
@@ -51,6 +57,8 @@ app.add_typer(evaluators_app, name="evaluators")
 app.add_typer(glossary_app, name="glossary")
 app.add_typer(memory_app, name="memory")
 app.add_typer(human_review_app, name="human-review")
+app.add_typer(review_app, name="review")
+app.add_typer(report_app, name="report")
 
 
 def _import_using_session(project: str, database: str):
@@ -282,6 +290,7 @@ def _stamp_existing_initial_schema(database: str) -> bool:
             table_names = set(inspector.get_table_names())
             expected_tables = set(Base.metadata.tables)
             suggestion_tables = {"glossary_suggestion_runs", "glossary_suggestions"}
+            lineage_tables = {"translation_version_parents"}
             present_suggestion_tables = suggestion_tables & table_names
             if not (table_names & expected_tables):
                 return False
@@ -293,14 +302,17 @@ def _stamp_existing_initial_schema(database: str) -> bool:
                 raise typer.BadParameter(
                     "Unversioned database contains only part of the glossary-suggestion schema; refusing to stamp it"
                 )
-            required_existing_tables = expected_tables - (suggestion_tables - present_suggestion_tables)
+            required_existing_tables = expected_tables - (suggestion_tables - present_suggestion_tables) \
+                - (lineage_tables - (lineage_tables & table_names))
             if not required_existing_tables.issubset(table_names):
                 raise typer.BadParameter(
                     "Database contains an incomplete unversioned schema; refusing to run migrations automatically"
                 )
             new_result_columns = {"plugin_id", "score", "confidence", "reasoning", "recommendations",
-                                  "detected_issues", "searchable_text"}
+                                  "detected_issues", "searchable_text", "strengths", "issue_details"}
             evaluation_payload_present = False
+            structured_feedback_present = False
+            lineage_present = False
             knowledge_usage_present: dict[str, bool] = {"glossary_entries": False,
                                                         "translation_memories": False}
             knowledge_usage_columns = {
@@ -313,11 +325,31 @@ def _stamp_existing_initial_schema(database: str) -> bool:
             }
             human_review_workflow_present = False
             for table_name in expected_tables:
+                if table_name not in table_names:
+                    continue
                 actual_columns = {column["name"] for column in inspector.get_columns(table_name)}
                 expected_columns = {column.name for column in Base.metadata.tables[table_name].columns}
+                if table_name == "translation_version_parents":
+                    if actual_columns != expected_columns:
+                        raise typer.BadParameter("Unversioned lineage table does not match the current schema")
+                    lineage_present = True
+                    continue
+                if table_name == "translation_versions":
+                    lineage_columns = {"artifact_kind", "prompt_version_id"}
+                    if actual_columns == expected_columns:
+                        pass
+                    elif actual_columns == expected_columns - lineage_columns:
+                        pass  # recognized pre-lineage schema; Alembic revision 0007 adds these columns
+                    else:
+                        raise typer.BadParameter("Unversioned translation_versions table does not match a known schema")
+                    continue
                 if table_name == "evaluation_results":
                     baseline_columns = expected_columns - new_result_columns
+                    pre_structured_columns = expected_columns - {"strengths", "issue_details"}
                     if actual_columns == expected_columns:
+                        evaluation_payload_present = True
+                        structured_feedback_present = True
+                    elif actual_columns == pre_structured_columns:
                         evaluation_payload_present = True
                     elif actual_columns != baseline_columns:
                         raise typer.BadParameter(
@@ -367,6 +399,9 @@ def _stamp_existing_initial_schema(database: str) -> bool:
                 required_triggers.update({
                     "trg_human_reviews_validate_insert", "trg_human_reviews_supersedes_scope",
                 })
+            if lineage_present:
+                required_triggers.update({"trg_translation_version_parents_no_update",
+                                          "trg_translation_version_parents_no_delete"})
             triggers = set(connection.exec_driver_sql(
                 "SELECT name FROM sqlite_master WHERE type='trigger'"
             ).scalars())
@@ -419,6 +454,8 @@ def _stamp_existing_initial_schema(database: str) -> bool:
                 if not {"ix_human_reviews_pass_chunk_created", "ix_human_reviews_status_created"}.issubset(review_indexes):
                     raise typer.BadParameter("Human-review workflow is missing required indexes")
                 revision = "0006_human_review_workflow"
+            if lineage_present and structured_feedback_present and revision == "0006_human_review_workflow":
+                revision = "0007_translation_lineage_feedback"
             if "alembic_version" not in table_names:
                 connection.exec_driver_sql(
                     "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
@@ -1268,12 +1305,15 @@ def _run_refinement_workflow(
         evaluations = {}
         for candidate in candidates:
             if candidate.status in {"completed", "partial"}:
+                registry, candidate_plugins = _evaluation_registry_for_version(
+                    session, candidate.version_id, selected_plugins, evaluation_config,
+                )
                 evaluations[candidate.version_id] = EvaluationService(
-                    session, evaluation_client,
+                    session, evaluation_client, registry,
                 ).evaluate_translation_version(
                     translation_version_id=candidate.version_id,
                     config=evaluation_config,
-                    plugin_selection=selected_plugins,
+                    plugin_selection=candidate_plugins,
                     model_selection=selected_evaluator_models,
                     progress_callback=callback,
                 )
@@ -1284,6 +1324,33 @@ def _run_refinement_workflow(
     finally:
         session.close()
         engine.dispose()
+
+
+def _evaluation_registry_for_version(session, version_id: UUID, selected_plugins, evaluation_config):
+    """Use the Scripture plugin registry for Scripture documents when installed."""
+    version = session.get(TranslationVersion, version_id)
+    if version is None or version.translation.document.domain.casefold() != "scripture":
+        return None, selected_plugins
+    try:
+        from scripture_plugin.registry import scripture_registry
+    except ImportError:
+        # The plugin is independently installable; core workflows remain usable
+        # without it, while the Scripture CLI remains available when installed.
+        return None, selected_plugins
+    entries = GlossaryService(session).entries_for_scope(
+        version.translation.document.project_id,
+        version.translation.document.source_locale,
+        version.translation.target_locale,
+    )
+    glossary_terms = tuple({
+        "source_term": entry.source_term, "preferred_translation": entry.target_term,
+        "target_locale": version.translation.target_locale, "notes": entry.notes or "",
+        "glossary": entry.glossary.name,
+    } for entry in entries)
+    registry = scripture_registry(glossary_terms=glossary_terms)
+    base_plugins = selected_plugins if selected_plugins is not None else list(evaluation_config.plugin_ids)
+    scripture_plugins = [plugin_id for plugin_id in registry.ids() if plugin_id.startswith("scripture.")]
+    return registry, list(dict.fromkeys([*base_plugins, *scripture_plugins]))
 
 
 def _print_refinement_results(candidates, evaluations) -> None:
@@ -1356,6 +1423,170 @@ def synthesize_translation(
         database=database, verbose=verbose,
     )
     _print_refinement_results(candidates, evaluations)
+
+
+@app.command("iterate")
+def iterate_translation(
+    translation_version_id: str = typer.Argument(..., help="Evaluated baseline translation version UUID"),
+    config_file: Path = typer.Option(Path("ai-translator.toml"), "--config", "-c"),
+    evaluation_config_file: Path = typer.Option(Path("ai-translator-evaluation.toml"), "--evaluation-config"),
+    max_iterations: int | None = typer.Option(None, "--max-iterations", min=1,
+                                               help="Override project translation_iteration.max_iterations"),
+    minimum_score_increase: float | None = typer.Option(None, "--minimum-score-increase", min=0),
+    minimum_confidence_increase: float | None = typer.Option(None, "--minimum-confidence-increase", min=0),
+    models: str | None = typer.Option(None, "--models"),
+    evaluator_models: str | None = typer.Option(None, "--evaluator-models"),
+    plugins: str | None = typer.Option(None, "--plugins"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Run bounded refine/evaluate cycles, recording every candidate in an experiment."""
+    try:
+        version_id = _parse_uuid(translation_version_id, "translation_version_id")
+        translation_config = TranslationConfig.from_file(config_file)
+        evaluation_config = EvaluationConfig.from_file(evaluation_config_file)
+        select_list = lambda value: [part.strip() for part in value.split(",") if part.strip()] if value else None
+        callback = (lambda message: typer.echo(message, err=True)) if verbose else None
+        engine = make_engine(database)
+        session = make_session_factory(engine)()
+        try:
+            iteration_registry, iteration_plugins = _evaluation_registry_for_version(
+                session, version_id, select_list(plugins), evaluation_config,
+            )
+            outcome = TranslationIterationService(
+                session,
+                OllamaClient(translation_config.base_url, timeout_seconds=translation_config.timeout_seconds),
+                OllamaClient(evaluation_config.base_url, timeout_seconds=evaluation_config.timeout_seconds),
+            ).run(
+                baseline_version_id=version_id, translation_config=translation_config,
+                evaluation_config=evaluation_config, max_iterations=max_iterations,
+                minimum_score_increase=minimum_score_increase,
+                minimum_confidence_increase=minimum_confidence_increase,
+                translation_models=select_list(models), evaluator_models=select_list(evaluator_models),
+                plugins=iteration_plugins, evaluation_registry=iteration_registry, progress=callback,
+            )
+        finally:
+            session.close()
+            engine.dispose()
+        typer.echo(f"Experiment {outcome.experiment_id}: {outcome.iterations} iteration(s), "
+                   f"selected version {outcome.selected_version_id}, score {outcome.score:.2f}, "
+                   f"confidence {outcome.confidence:.3f}; converged={outcome.converged} ({outcome.reason})")
+    except (TranslationError, EvaluationError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _emit_json_report(report: dict, output: Path | None = None) -> None:
+    rendered = json.dumps(report, ensure_ascii=False, indent=2, default=str)
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered + "\n", encoding="utf-8")
+        typer.echo(f"Report written to {output}")
+    else:
+        typer.echo(rendered)
+
+
+@review_app.command("compare")
+def compare_translation_versions(
+    version_ids: list[str] = typer.Argument(..., help="Translation version UUIDs to compare"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Compare post-evaluation results; the report does not automatically select a winner."""
+    try:
+        ids = [_parse_uuid(value, "translation_version_id") for value in version_ids]
+        engine = make_engine(database)
+        session = make_session_factory(engine)()
+        try:
+            _emit_json_report(comparison_report(session, ids))
+        finally:
+            session.close()
+            engine.dispose()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+@report_app.command("lineage")
+def report_translation_lineage(
+    version_id: str = typer.Argument(...),
+    output: Path | None = typer.Option(None, "--output", "-o"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Show parent and source-candidate artifacts for a translation version."""
+    engine = make_engine(database)
+    session = make_session_factory(engine)()
+    try:
+        _emit_json_report(lineage_report(session, _parse_uuid(version_id, "version_id")), output)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@report_app.command("convergence")
+def report_translation_convergence(
+    experiment_id: str = typer.Argument(...),
+    output: Path | None = typer.Option(None, "--output", "-o"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Show experiment iteration history and convergence configuration."""
+    engine = make_engine(database)
+    session = make_session_factory(engine)()
+    try:
+        _emit_json_report(convergence_report(session, _parse_uuid(experiment_id, "experiment_id")), output)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@report_app.command("improvement")
+def report_translation_improvement(
+    version_id: str = typer.Argument(...),
+    baseline: str | None = typer.Option(None, "--baseline", help="Explicit baseline version UUID"),
+    output: Path | None = typer.Option(None, "--output", "-o"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Compare a refined candidate with its recorded parent or an explicit baseline."""
+    engine = make_engine(database)
+    session = make_session_factory(engine)()
+    try:
+        baseline_id = _parse_uuid(baseline, "baseline") if baseline else None
+        _emit_json_report(improvement_report(
+            session, _parse_uuid(version_id, "version_id"), baseline_id,
+        ), output)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        session.close()
+        engine.dispose()
+
+
+@report_app.command("side-by-side")
+def report_side_by_side_translations(
+    version_ids: list[str] = typer.Argument(..., help="Translation version UUIDs for aligned comparison"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Markdown file; omit to print to stdout"),
+    database: str = typer.Option("sqlite:///ai_translator.db", "--database"),
+) -> None:
+    """Show source segments beside each selected translation version."""
+    engine = make_engine(database)
+    session = make_session_factory(engine)()
+    try:
+        report = side_by_side_report(
+            session, [_parse_uuid(value, "version_id") for value in version_ids],
+        )
+        if output is None:
+            typer.echo(report)
+        else:
+            destination = output.expanduser()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(report, encoding="utf-8")
+            typer.echo(f"Side-by-side report written to {destination}")
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    finally:
+        session.close()
+        engine.dispose()
 
 
 @app.command("models")

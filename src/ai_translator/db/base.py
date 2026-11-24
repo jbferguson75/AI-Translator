@@ -37,14 +37,17 @@ def prevent_source_mutation(session: Session, _flush_context, _instances) -> Non
         "Chunk": {"document_id", "chapter_id", "verse_id", "stable_key", "ordinal",
                   "source_text", "source_hash", "locator"},
         "TranslationVersion": {"translation_id", "version_number", "parent_version_id",
-                               "model_run_id", "author_kind", "status", "content_hash", "run_manifest"},
+                               "model_run_id", "author_kind", "artifact_kind", "status", "content_hash",
+                               "prompt_version_id", "run_manifest"},
+        "TranslationVersionParent": {"child_version_id", "parent_version_id", "relationship_kind",
+                                      "ordinal", "created_at"},
         "TranslationSegment": {"translation_version_id", "chunk_id", "target_text", "target_hash"},
         "EvaluationVersion": {"evaluation_id", "translation_version_id", "model_run_id",
                               "version_number", "status", "rubric_version", "plugin_manifest", "run_manifest"},
         "EvaluationResult": {"evaluation_version_id", "plugin_id", "metric_key", "scope_key",
-                             "score", "confidence", "reasoning", "recommendations",
-                             "detected_issues", "searchable_text", "value", "categorical_value",
-                             "finding", "evidence"},
+                             "score", "confidence", "reasoning", "strengths", "recommendations",
+                             "detected_issues", "issue_details", "searchable_text", "value",
+                             "categorical_value", "finding", "evidence"},
         "HumanReview": {"review_pass_id", "reviewer", "decision", "chunk_id", "comment",
                         "proposed_text", "status", "review_notes", "correction", "override_reason",
                         "approval_date", "supersedes_review_id", "previous_event_hash", "event_hash",
@@ -59,7 +62,7 @@ def prevent_source_mutation(session: Session, _flush_context, _instances) -> Non
             raise ValueError("Original source text and structure are immutable; create a new document snapshot")
     append_only = {"TranslationVersion", "TranslationSegment", "EvaluationVersion",
                    "EvaluationResult", "HumanReview", "PromptVersion", "PublishedOutput",
-                   "Book", "Chapter", "Verse", "Chunk"}
+                   "TranslationVersionParent", "Book", "Chapter", "Verse", "Chunk"}
     if any(type(entity).__name__ in append_only for entity in session.deleted):
         raise ValueError("This record is append-only and cannot be deleted")
 

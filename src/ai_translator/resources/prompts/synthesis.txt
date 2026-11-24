@@ -10,6 +10,9 @@ Source language: $source_locale
 Target language: $target_locale
 Target reading level: $reading_level
 Source locator: $locator
+Content type: $content_type
+Voice profile: $voice_profile
+Translation goals (JSON): $translation_goals
 
 <source_text>
 $source_text
